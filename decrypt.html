@@ -3,16 +3,18 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>小说批量加密工厂</title>
+    <title>小说批量解密工具</title>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
+    <!-- CryptoJS 仅用于解密旧版（U2FsdGVkX1 开头）的文件 -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/crypto-js/4.1.1/crypto-js.min.js"></script>
     <style>
         body { font-family: sans-serif; padding: 40px; max-width: 800px; margin: 0 auto; background: #f0f2f5; }
         .card { background: white; padding: 30px; border-radius: 12px; box-shadow: 0 4px 12px rgba(0,0,0,0.1); margin-bottom: 20px; }
         h2 { margin-top: 0; color: #333; }
-        .step { margin-bottom: 20px; border-left: 4px solid #4CAF50; padding-left: 15px; }
+        .step { margin-bottom: 20px; border-left: 4px solid #2196F3; padding-left: 15px; }
         input[type="text"], input[type="password"] { width: 100%; padding: 12px; margin-top: 8px; box-sizing: border-box; border: 1px solid #ddd; border-radius: 6px; font-size: 16px; }
-        button { background-color: #4CAF50; color: white; border: none; padding: 12px 24px; border-radius: 6px; font-size: 16px; cursor: pointer; transition: 0.2s; }
-        button:hover { background-color: #45a049; }
+        button { background-color: #2196F3; color: white; border: none; padding: 12px 24px; border-radius: 6px; font-size: 16px; cursor: pointer; transition: 0.2s; }
+        button:hover { background-color: #1976D2; }
         button:disabled { background-color: #ccc; cursor: not-allowed; }
         #file-list { margin-top: 10px; max-height: 200px; overflow-y: auto; border: 1px solid #eee; padding: 10px; border-radius: 6px; }
         .file-item { padding: 5px; border-bottom: 1px solid #f5f5f5; font-size: 14px; display: flex; justify-content: space-between; }
@@ -24,38 +26,39 @@
 <body>
 
     <div class="card">
-        <h2>🔒 小说批量加密工具</h2>
-        <p style="color: #666;">专门适配 Google Drive 导出的 TXT 文件 ｜ <a href="decrypt.html">前往解密工具 →</a></p>
+        <h2>🔓 小说批量解密工具</h2>
+        <p style="color: #666;">解密本工具生成的 _enc.txt 文件（兼容旧版格式） ｜ <a href="index.html">← 返回加密工具</a></p>
 
         <div class="step">
-            <h3>1. 设置全局密码</h3>
-            <p style="font-size: 0.9em; color: #888;">所有选中的文件将使用同一个密码加密，密码丢失后无法找回</p>
-            <input type="password" id="password" placeholder="请输入解密密钥 (例如: mySecretKey123)">
+            <h3>1. 输入密码</h3>
+            <p style="font-size: 0.9em; color: #888;">使用加密时设置的同一个密码</p>
+            <input type="password" id="password" placeholder="请输入解密密钥">
             <label class="pwd-toggle"><input type="checkbox" id="togglePwd"> 显示密码</label>
         </div>
 
         <div class="step">
-            <h3>2. 选择文件 (支持多选)</h3>
+            <h3>2. 选择加密文件 (支持多选)</h3>
             <input type="file" id="fileInput" multiple accept=".txt,text/plain">
             <div id="file-list"></div>
         </div>
 
         <div class="step">
             <h3>3. 开始处理</h3>
-            <button onclick="processFiles()" id="btn-process">加密并下载 ZIP 包</button>
+            <button onclick="processFiles()" id="btn-process">解密并下载 ZIP 包</button>
             <div id="status" style="margin-top: 15px; font-weight: bold;"></div>
         </div>
     </div>
 
     <script>
-        // 加密格式 v2：PBKDF2-SHA256(600000 次) 派生 AES-256-GCM 密钥
-        // 输出：NOVELENC2:<盐 base64>:<IV base64>:<密文+校验标签 base64>
+        // 新版格式：NOVELENC2:<盐 base64>:<IV base64>:<密文+校验标签 base64>
+        // 密钥派生：PBKDF2-SHA256，600000 次迭代，AES-256-GCM
         const FORMAT_PREFIX = 'NOVELENC2';
         const PBKDF2_ITERATIONS = 600000;
 
         const fileInput = document.getElementById('fileInput');
         const fileListDiv = document.getElementById('file-list');
         const statusDiv = document.getElementById('status');
+        const keyCache = new Map(); // 盐(base64) -> CryptoKey Promise，同批文件共用盐时只派生一次
 
         document.getElementById('togglePwd').addEventListener('change', function() {
             document.getElementById('password').type = this.checked ? 'text' : 'password';
@@ -82,29 +85,11 @@
             statusDiv.className = ok === true ? 'success' : ok === false ? 'error' : '';
         }
 
-        // 自动识别 UTF-8 / UTF-16(带 BOM) / GBK(GB18030)，避免中文 TXT 乱码后被加密
-        function decodeTextBuffer(buf) {
-            const bytes = new Uint8Array(buf);
-            if (bytes.length >= 2 && bytes[0] === 0xFF && bytes[1] === 0xFE) {
-                return new TextDecoder('utf-16le').decode(bytes.subarray(2));
-            }
-            if (bytes.length >= 2 && bytes[0] === 0xFE && bytes[1] === 0xFF) {
-                return new TextDecoder('utf-16be').decode(bytes.subarray(2));
-            }
-            try {
-                return new TextDecoder('utf-8', { fatal: true }).decode(buf).replace(/^\uFEFF/, '');
-            } catch (e) {
-                return new TextDecoder('gb18030').decode(buf);
-            }
-        }
-
-        function bytesToBase64(bytes) {
-            let binary = '';
-            const CHUNK = 0x8000; // 分块拼接，避免大文件撑爆调用栈
-            for (let i = 0; i < bytes.length; i += CHUNK) {
-                binary += String.fromCharCode.apply(null, bytes.subarray(i, i + CHUNK));
-            }
-            return btoa(binary);
+        function base64ToBytes(b64) {
+            const binary = atob(b64);
+            const bytes = new Uint8Array(binary.length);
+            for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+            return bytes;
         }
 
         async function deriveKey(password, salt) {
@@ -112,14 +97,46 @@
                 'raw', new TextEncoder().encode(password), 'PBKDF2', false, ['deriveKey']);
             return crypto.subtle.deriveKey(
                 { name: 'PBKDF2', salt: salt, iterations: PBKDF2_ITERATIONS, hash: 'SHA-256' },
-                baseKey, { name: 'AES-GCM', length: 256 }, false, ['encrypt']);
+                baseKey, { name: 'AES-GCM', length: 256 }, false, ['decrypt']);
         }
 
-        async function encryptText(text, key, saltB64) {
-            const iv = crypto.getRandomValues(new Uint8Array(12));
-            const cipherBuf = await crypto.subtle.encrypt(
-                { name: 'AES-GCM', iv: iv }, key, new TextEncoder().encode(text));
-            return [FORMAT_PREFIX, saltB64, bytesToBase64(iv), bytesToBase64(new Uint8Array(cipherBuf))].join(':');
+        async function decryptContent(raw, password) {
+            const trimmed = raw.trim();
+
+            if (trimmed.startsWith(FORMAT_PREFIX + ':')) {
+                const parts = trimmed.split(':');
+                if (parts.length !== 4) throw new Error('文件头格式不正确');
+                const saltB64 = parts[1];
+                let keyPromise = keyCache.get(saltB64);
+                if (!keyPromise) {
+                    keyPromise = deriveKey(password, base64ToBytes(saltB64));
+                    keyCache.set(saltB64, keyPromise);
+                }
+                const key = await keyPromise;
+                let plainBuf;
+                try {
+                    plainBuf = await crypto.subtle.decrypt(
+                        { name: 'AES-GCM', iv: base64ToBytes(parts[2]) }, key, base64ToBytes(parts[3]));
+                } catch (e) {
+                    throw new Error('密码错误或文件损坏');
+                }
+                return new TextDecoder().decode(plainBuf);
+            }
+
+            // 旧版格式：CryptoJS.AES.encrypt(text, password) 的 OpenSSL 兼容输出（"Salted__" 的 base64）
+            if (trimmed.startsWith('U2FsdGVkX1')) {
+                if (typeof CryptoJS === 'undefined') throw new Error('CryptoJS 未加载，解密旧版文件需要联网');
+                let plain;
+                try {
+                    plain = CryptoJS.AES.decrypt(trimmed, password).toString(CryptoJS.enc.Utf8);
+                } catch (e) {
+                    throw new Error('密码错误或文件损坏');
+                }
+                if (!plain) throw new Error('密码错误或文件损坏');
+                return plain;
+            }
+
+            throw new Error('无法识别的格式，可能不是本工具加密的文件');
         }
 
         function uniqueZipName(zip, name) {
@@ -135,8 +152,8 @@
             const password = document.getElementById('password').value;
             const btn = document.getElementById('btn-process');
 
-            if (files.length === 0) { alert('请先选择至少一个 TXT 文件'); return; }
-            if (!password.trim()) { alert('请输入加密密码'); return; }
+            if (files.length === 0) { alert('请先选择至少一个加密的 TXT 文件'); return; }
+            if (!password.trim()) { alert('请输入解密密码'); return; }
             if (typeof JSZip === 'undefined') { showStatus('❌ JSZip 未加载，请检查网络后刷新页面', false); return; }
             if (!window.crypto || !crypto.subtle) {
                 showStatus('❌ 当前环境不支持 Web Crypto，请通过 HTTPS 访问或直接双击打开本地文件', false);
@@ -144,48 +161,46 @@
             }
 
             btn.disabled = true;
-            showStatus('正在派生密钥...');
+            keyCache.clear();
+            showStatus('正在解密中...');
 
             try {
-                // 每批次生成一个随机盐并只派生一次密钥；盐写入每个文件头，单个文件仍可独立解密
-                const salt = crypto.getRandomValues(new Uint8Array(16));
-                const saltB64 = bytesToBase64(salt);
-                const key = await deriveKey(password, salt);
-
                 const zip = new JSZip();
                 const failed = [];
                 let count = 0;
 
                 for (const file of files) {
                     try {
-                        const text = decodeTextBuffer(await file.arrayBuffer());
-                        const encrypted = await encryptText(text, key, saltB64);
-                        const newName = uniqueZipName(zip, file.name.replace(/\.txt$/i, '') + '_enc.txt');
-                        zip.file(newName, encrypted);
+                        const raw = await file.text(); // 加密文件本身是纯 ASCII 文本
+                        const plain = await decryptContent(raw, password);
+                        const newName = /_enc\.txt$/i.test(file.name)
+                            ? file.name.replace(/_enc\.txt$/i, '.txt')
+                            : file.name.replace(/\.txt$/i, '') + '_dec.txt';
+                        zip.file(uniqueZipName(zip, newName), plain);
                         count++;
                     } catch (err) {
-                        console.error('处理失败: ' + file.name, err);
-                        failed.push(file.name);
+                        console.error('解密失败: ' + file.name, err);
+                        failed.push(file.name + '（' + (err && err.message ? err.message : err) + '）');
                     }
-                    showStatus('正在加密中... (' + count + '/' + files.length + ')');
+                    showStatus('正在解密中... (' + count + '/' + files.length + ')');
                 }
 
                 if (count === 0) {
-                    showStatus('❌ 所有文件都加密失败，未生成压缩包', false);
+                    showStatus('❌ 没有文件解密成功。' + failed.join('；'), false);
                     return;
                 }
 
-                showStatus('加密完成 (' + count + '/' + files.length + ')，正在生成压缩包...');
+                showStatus('解密完成 (' + count + '/' + files.length + ')，正在生成压缩包...');
                 const content = await zip.generateAsync({ type: 'blob' });
                 const url = URL.createObjectURL(content);
                 const a = document.createElement('a');
                 a.href = url;
-                a.download = '加密小说包.zip';
+                a.download = '解密小说包.zip';
                 a.click();
                 setTimeout(() => URL.revokeObjectURL(url), 60000);
 
-                let msg = '✅ 成功！已下载“加密小说包.zip”(' + count + '/' + files.length + ')。请解压后上传到 GitHub。';
-                if (failed.length > 0) msg += ' 失败：' + failed.join('、');
+                let msg = '✅ 成功！已下载“解密小说包.zip”(' + count + '/' + files.length + ')。';
+                if (failed.length > 0) msg += ' 失败：' + failed.join('；');
                 showStatus(msg, failed.length === 0);
             } catch (err) {
                 console.error(err);
